@@ -1,0 +1,18 @@
+# Build files
+build
+*.uf2
+
+# Python related
+venv
+.venv
+*.pyc
+__pycache__
+
+# Controller solutions
+controllers/pid_ctrl.c
+controllers/io_decoupling_3r.c
+controllers/static_lin_unicycle_kin.c
+controllers/static_lin_unicycle_dyn.c
+controllers/dynamic_lin_unicycle_kin.c
+controllers/dynamic_lin_unicycle_dyn.c
+src/trajectory.c)
