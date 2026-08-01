@@ -15,4 +15,4 @@ controllers/static_lin_unicycle_kin.c
 controllers/static_lin_unicycle_dyn.c
 controllers/dynamic_lin_unicycle_kin.c
 controllers/dynamic_lin_unicycle_dyn.c
-src/trajectory.c)
+src/trajectory.c
