@@ -8,6 +8,9 @@ venv
 *.pyc
 __pycache__
 
+# logs
+scripts/logs/
+
 # Controller solutions
 controllers/pid_ctrl.c
 controllers/io_decoupling_3r.c
