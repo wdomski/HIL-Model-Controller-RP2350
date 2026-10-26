@@ -3,6 +3,12 @@
 #include "aproto/aproto.h"
 #include "hil_registry.h"
 #include "trajectory.h"
+#include "parameters.h"
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
 
 #define LOG_PERIOD_DEFAULT_MS 200u
 #define LOG_PERIOD_MIN_MS 10u
@@ -255,7 +261,66 @@ static aproto_command_result_t handle_rstall(
     return APROTO_COMMAND_OK;
 }
 
+/* Parameter values use round-trip float precision, including exponent notation.
+ * The shared protocol's lightweight eatof parser accepts decimals only. */
+static int parameter_float(const aproto_request_t *request, size_t index, float *value)
+{
+    aproto_string_t argument;
+    char number[48], *end;
+    if (aproto_argument_string(request, index, &argument) != 0 ||
+        argument.length >= sizeof(number)) return -1;
+    memcpy(number, argument.data, argument.length);
+    number[argument.length] = '\0';
+    errno = 0;
+    *value = strtof(number, &end);
+    return errno != ERANGE && end != number && *end == '\0' && isfinite(*value) ? 0 : -1;
+}
+
+static aproto_command_result_t handle_parameters(
+    const aproto_request_t *request, aproto_response_t *response, void *context)
+{
+    int write = context != NULL;
+    int id;
+    aproto_string_t kind;
+    float values[PARAMETERS_MAX];
+    size_t argc = aproto_argument_count(request);
+    if (request->query || argc < 2u || (!write && argc != 2u) ||
+        argc > PARAMETERS_MAX + 2u || application.parameters == NULL ||
+        aproto_argument_string(request, 0u, &kind) != 0 || kind.length != 1u ||
+        (kind.data[0] != 'M' && kind.data[0] != 'C' && kind.data[0] != 'T') ||
+        aproto_argument_int(request, 1u, &id) != 0 || id < 0)
+        return APROTO_COMMAND_ERROR;
+    size_t count = write ? argc - 2u : PARAMETERS_MAX;
+    if (write) {
+        for (size_t i = 0; i < count; ++i)
+            if (parameter_float(request, i + 2u, &values[i]) != 0 ||
+                !isfinite(values[i])) return APROTO_COMMAND_ERROR;
+    }
+    int n = application.parameters(kind.data[0], id, values, count, write);
+    if (n < 0 || n > (int)PARAMETERS_MAX) return APROTO_COMMAND_ERROR;
+    /* Always return parameter results, even when action ACKs are disabled. */
+    aproto_response_append(response, write ? "OK,PSET," : "OK,PGET,");
+    aproto_response_append_n(response, kind.data, 1u);
+    aproto_response_append(response, ",");
+    aproto_response_append_int(response, id);
+    if (!write) {
+        aproto_response_append(response, ",");
+        aproto_response_append_int(response, PARAMETERS_VERSION);
+        for (int i = 0; i < n; ++i) {
+            char number[24];
+            if (!isfinite(values[i])) return APROTO_COMMAND_ERROR;
+            int length = snprintf(number, sizeof(number), ",%.9g", (double)values[i]);
+            if (length < 0 || (size_t)length >= sizeof(number)) return APROTO_COMMAND_ERROR;
+            aproto_response_append_n(response, number, (size_t)length);
+        }
+    }
+    return APROTO_COMMAND_DATA;
+}
+
+static const int parameter_write = 1;
 static const aproto_command_t commands[] = {
+    { "PGET", handle_parameters, NULL },
+    { "PSET", handle_parameters, (void *)&parameter_write },
     { "MODELS", handle_models, NULL },
     { "MODEL", handle_model, NULL },
     { "CTRLS", handle_ctrls, NULL },

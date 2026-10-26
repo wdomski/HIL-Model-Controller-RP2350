@@ -14,6 +14,7 @@
 #include "config_hw.h"
 #include "main.h"
 #include "comm.h"
+#include "parameters.h"
 #include "hil_registry.h"
 #include "controller.h"
 #include "pid_ctrl.h"
@@ -56,8 +57,7 @@ int ret;
  * PWM scales MUST mirror the model application (see *_SCALE in src/main_model.c):
  *   measured  <- model outputs (in_scale),  control -> model inputs (out_scale).
  */
-#define CTRL_MODEL_ID   MODEL_MASS_SPRING_DAMPER /* model selected at boot (MDS) */
-#define CTRL_DEFAULT    CTRL_PID /* default controller slot (PID) */
+#define CTRL_DEFAULT    CTRL_OFF
 
 #define CTRL_STEP_US      1000   /* 1 kHz control loop */
 /* Telemetry period is configured at runtime via "$LOG,<ms>" (see comm.c). */
@@ -207,7 +207,7 @@ static const float sc_ctrl_mds[1] = { 50.0f };
  * may differ (e.g. the unicycle reads 3, targets 2, drives 2). Slot ids, display
  * names and the slot count come from the CMake-generated registry
  * (hil_registry.h); a registry slot without a wiring row below stays all-zero
- * and is rejected by comm_controller_select().
+ * and is rejected by comm_controller_select(), except for CTRL_OFF.
  */
 typedef struct
 {
@@ -222,6 +222,7 @@ typedef struct
 } ctrl_slot_t;
 
 static ctrl_slot_t ctrl_slots[HIL_CTRL_COUNT] = {
+    [CTRL_OFF]         = { 0 },
     [CTRL_PID]         = { &ctrl_pid,      1, 1, 1, sc_meas_pid,      sc_ctrl_pid      },
     [CTRL_IO3R]        = { &ctrl_io3r,     6, 3, 3, sc_meas_io3r,     sc_ctrl_io3r,
            NULL, offset_traj_io3r },
@@ -250,7 +251,7 @@ static ctrl_slot_t ctrl_slots[HIL_CTRL_COUNT] = {
 };
 
 static ctrl_slot_t *active;
-static int selected_ctrl = CTRL_DEFAULT;  /* selected controller slot (0 = PID) */
+static int selected_ctrl = CTRL_DEFAULT;
 
 static float measured[CTRL_MAX];
 static float setpoint[CTRL_MAX];
@@ -331,6 +332,19 @@ manipulator_3r_params_t manipulator_3r_params = {
     .Tv = 0.1f, .Ts = 0.05f, .Tk = 100.0f
 };
 
+/* UART parsing and controller updates share this core, so a complete block
+ * commits between updates. Reading a slot does not select/reset it. */
+static int comm_parameters(char kind, int id, float *values, size_t count, int write)
+{
+  if (kind == 'T') return parameters_trajectory(id, values, count, write);
+  if (kind != 'C' || id < 0 || id >= HIL_CTRL_COUNT) return -1;
+  int result = parameters_controller(id, ctrl_slots[id].ctrl, CTRL_STEP_US * 1e-6f,
+                                     values, count, write);
+  if (result >= 0 && write && id == CTRL_IO3R)
+    manipulator_3r_params = io3r.model;
+  return result;
+}
+
 /* Set a constant setpoint for the callback registered with comm_init(). */
 int comm_setpoint_const(int index, float value)
 {
@@ -366,12 +380,25 @@ int comm_setpoint_traj(int index, int type)
 /* Select the active controller for the callback registered with comm_init(). */
 int comm_controller_select(int id)
 {
-  if (id < 0 || (uint32_t)id >= HIL_CTRL_COUNT || ctrl_slots[id].ctrl == NULL)
+  if (id < 0 || (uint32_t)id >= HIL_CTRL_COUNT ||
+      (id != CTRL_OFF && ctrl_slots[id].ctrl == NULL))
   {
     return -1;
   }
   active = &ctrl_slots[id];
-  controller_reset(active->ctrl);
+  if (active->ctrl != NULL)
+  {
+    controller_reset(active->ctrl);
+  }
+  else
+  {
+    memset(setpoint, 0, sizeof(setpoint));
+    memset(control, 0, sizeof(control));
+    for (uint32_t i = 0; i < CTRL_MAX; i++)
+    {
+      pwm_output_set_value(pwm_output_pins, i, 0.0f, 0.0f, 1.0f);
+    }
+  }
   selected_ctrl = id;
   sync_controller_trajectories();
   return 0;
@@ -380,7 +407,7 @@ int comm_controller_select(int id)
 /* Reset the active controller for the callback registered with comm_init(). */
 void comm_reset(void)
 {
-  if (active != NULL)
+  if (active != NULL && active->ctrl != NULL)
   {
     controller_reset(active->ctrl);
     float epoch_s = now_s();
@@ -437,6 +464,7 @@ int main(void)
     .controller_select = comm_controller_select,
     .reset = comm_reset,
     .reset_remote = comm_reset_remote,
+    .parameters = comm_parameters,
   };
 
   // set clock speed to 150 MHz
@@ -493,14 +521,7 @@ int main(void)
   mds_estimator_stiffness_init(&ctrl_mds_es_k, &mds_es_k, &mds_plant, 0.0f, MDS_EST_G, MDS_EST_L0, MDS_EST_L1, mds_est_amp, mds_est_w);
   custom_ctrl_init(&ctrl_custom, &custom, 1);
   // select the default controller slot
-  active = &ctrl_slots[CTRL_DEFAULT];
-
-  // wait for the model HW to boot, then select the model over the link (uart1)
-  sleep_ms(1000);
-  int len = comm_build_model_select((char *)buffer_uart_tx,
-                                    UART_BUFFER_TX_SIZE, CTRL_MODEL_ID);
-  send_with_repeat(&serial_link, buffer_uart_tx, (uint32_t)len);
-  sleep_ms(200);
+  comm_controller_select(CTRL_DEFAULT);
 
   absolute_time_t now;
   absolute_time_t last_ctrl = get_absolute_time();
@@ -542,7 +563,10 @@ int main(void)
 
       // compute the control signal (timed for debug)
       absolute_time_t ctrl_t0 = get_absolute_time();
-      controller_update(active->ctrl, setpoint, measured, control, CTRL_STEP_US * 1e-6f);
+      if (active->ctrl != NULL)
+      {
+        controller_update(active->ctrl, setpoint, measured, control, CTRL_STEP_US * 1e-6f);
+      }
       ctrl_exec_time_us = absolute_time_diff_us(ctrl_t0, get_absolute_time());
 
       // write the control signal to the model inputs
@@ -550,6 +574,7 @@ int main(void)
       {
         pwm_output_set_value(pwm_output_pins, i, control[i], 0.0f, active->out_scale[i]);
       }
+      led_heartbeat(led_pins[0], to_ms_since_boot(now), active->ctrl != NULL);
     }
 
     // handle user commands from uart0 (setpoint / trajectory selection)
@@ -575,9 +600,16 @@ int main(void)
       last_tlm = now;
       char *p = (char *)tlm_buf;
       p += esprintf(p, "[CTRL] t=%d ", (int)to_ms_since_boot(now));
-      p = tlm_append(p, "y=", measured, active->n_meas);
-      p = tlm_append(p, " sp=", setpoint, active->n_sp);
-      p = tlm_append(p, " u=", control, active->n_ctrl);
+      if (selected_ctrl == CTRL_OFF)
+      {
+        p += esprintf(p, "OFF");
+      }
+      else
+      {
+        p = tlm_append(p, "y=", measured, active->n_meas);
+        p = tlm_append(p, " sp=", setpoint, active->n_sp);
+        p = tlm_append(p, " u=", control, active->n_ctrl);
+      }
       if (comm_utilization_enabled())
       {
         float utilization = 100.0f * (float)ctrl_exec_time_us / (float)CTRL_STEP_US;

@@ -87,7 +87,7 @@ else()
     target_compile_options(HIL_Trajectories PRIVATE -O0 -Wall)
 endif()
 
-## Mode
+## Model 
 
 add_executable(HIL_Model
     src/main_model.c
@@ -97,6 +97,7 @@ add_executable(HIL_Model
     src/hw_test.c
     src/serial.c
     src/comm.c
+    src/parameters.c
     src/utils.c
 
     models/model.c
@@ -110,6 +111,7 @@ target_include_directories(HIL_Model
 PUBLIC
 inc
 models
+controllers
 ${HIL_REGISTRY_DIR})
 
 target_compile_options(HIL_Model 
@@ -162,6 +164,7 @@ add_executable(HIL_Ctrl
     src/hw_test.c
     src/serial.c
     src/comm.c
+    src/parameters.c
     src/utils.c
 
     # model sources used by the controllers and the telemetry

@@ -1,8 +1,10 @@
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
+#include "parameters.h"
 
 #include "hardware/clocks.h"
 #include "hardware/dma.h"
@@ -57,6 +59,29 @@ typedef struct
 
 static fifo_t model_cmd_queue;
 static model_cmd_t model_cmd_storage[MODEL_CMD_QUEUE_DEPTH];
+
+/* Only core 1 reads/writes parameter blocks. Core 0 waits for the committed
+ * result; the simulation loop consumes requests without blocking. */
+typedef struct {
+  char kind;
+  int id, write, result;
+  size_t count;
+  float values[PARAMETERS_MAX];
+} parameter_request_t;
+static fifo_t parameter_requests, parameter_results;
+static parameter_request_t parameter_request_storage[1], parameter_result_storage[1];
+
+static int comm_parameters(char kind, int id, float *values, size_t count, int write)
+{
+  if ((kind != 'M' && kind != 'T') || count > PARAMETERS_MAX) return -1;
+  parameter_request_t request = { .kind = kind, .id = id, .write = write, .count = count };
+  if (write) memcpy(request.values, values, count * sizeof(float));
+  if (!fifo_try_add(&parameter_requests, &request)) return -1;
+  while (!fifo_try_remove(&parameter_results, &request)) sleep_us(50);
+  if (!write && request.result >= 0)
+    memcpy(values, request.values, (size_t)request.result * sizeof(float));
+  return request.result;
+}
 
 absolute_time_t current_time_core1;
 absolute_time_t last_time_model_run;
@@ -163,6 +188,57 @@ unicycle_params_t unicycle_dyn_params = {
 };
 
 model_t unicycle_dyn_model;
+
+static int arm_start_valid(const manipulator_3r_params_t *params)
+{
+  float position[3], velocity[3], state[MANIP3R_N_STATES];
+  for (int i = 0; i < 3; ++i) {
+    trajectory_t *tr = trajectory_get((trajectory_type_t)(TRAJ_CIRCLE3D_X + i));
+    position[i] = trajectory_eval(tr, 0.0f);
+    velocity[i] = trajectory_eval_d1(tr, 0.0f);
+    if (!isfinite(position[i]) || !isfinite(velocity[i])) return 0;
+  }
+  position[0] -= 0.12f;
+  if (manipulator_3r_inverse_kinematics(position, velocity, 1, params, state) != 0) return 0;
+  for (int i = 0; i < MANIP3R_N_STATES; ++i)
+    if (!isfinite(state[i])) return 0;
+  return 1;
+}
+
+static int model_parameters(parameter_request_t *request)
+{
+  int id = request->id;
+  float *v = request->values;
+  if (request->kind == 'T') {
+    float previous[PARAMETERS_MAX];
+    int n = parameters_trajectory(id, previous, PARAMETERS_MAX, 0);
+    if (n < 0) return -1;
+    n = parameters_trajectory(id, v, request->count, request->write);
+    if (n >= 0 && request->write && id >= TRAJ_CIRCLE3D_X &&
+        !arm_start_valid(&manipulator_3r_params)) {
+      parameters_trajectory(id, previous, (size_t)n, 1);
+      return -1;
+    }
+    return n;
+  }
+  void *sets[HIL_MODEL_COUNT] = {
+    [MODEL_MASS_SPRING_DAMPER] = &mds_params,
+    [MODEL_PENDULUM_CART] = &pendulum_cart_params,
+    [MODEL_DOUBLE_PENDULUM] = &double_pendulum_params,
+    [MODEL_MANIPULATOR_3R] = &manipulator_3r_params,
+    [MODEL_UNICYCLE] = &unicycle_params,
+    [MODEL_UNICYCLE_DYN] = &unicycle_dyn_params,
+  };
+  if (id < 0 || id >= HIL_MODEL_COUNT) return -1;
+  if (id == MODEL_MANIPULATOR_3R && request->write) {
+    manipulator_3r_params_t candidate = manipulator_3r_params;
+    int n = parameters_model(id, &candidate, v, request->count, 1);
+    if (n < 0 || !arm_start_valid(&candidate)) return -1;
+    manipulator_3r_params = candidate;
+    return n;
+  }
+  return parameters_model(id, sets[id], v, request->count, request->write);
+}
 
 /* Shared ODE solver and buffers (one model runs at a time). */
 ode_solver_t solver;
@@ -380,6 +456,13 @@ void main_core1(void){
     }
 
     // 1) read inputs: unified over all 8 PWM channels
+    parameter_request_t request;
+    if (fifo_try_remove(&parameter_requests, &request)) {
+      request.result = model_parameters(&request);
+      bool added = fifo_try_add(&parameter_results, &request);
+      hard_assert(added);
+    }
+
     model_read_inputs(model_inputs);
     // re-arm DMA so fresh samples are captured before the next cycle
     pwm_input_rearm();
@@ -396,6 +479,7 @@ void main_core1(void){
 
     // 3) write outputs: unified over all 8 PWM channels
     model_write_outputs(model_outputs);
+    led_heartbeat(led_pins[0], to_ms_since_boot(current_time_core1), active_model != NULL);
   }
 
 }
@@ -406,6 +490,7 @@ int main(void)
     .model_select = comm_model_select,
     .reset = comm_reset,
     .reset_remote = comm_reset_remote,
+    .parameters = comm_parameters,
   };
 
   // set clock speed to 150 MHz
@@ -429,6 +514,8 @@ int main(void)
 
   // model-selection queue must be ready before core 1 starts consuming it
   fifo_init(&model_cmd_queue, sizeof(model_cmd_t), MODEL_CMD_QUEUE_DEPTH, model_cmd_storage);
+  fifo_init(&parameter_requests, sizeof(parameter_request_t), 1, parameter_request_storage);
+  fifo_init(&parameter_results, sizeof(parameter_request_t), 1, parameter_result_storage);
 
   // enable model loop on separate core
   multicore_launch_core1(main_core1);

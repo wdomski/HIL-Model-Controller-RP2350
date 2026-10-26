@@ -6,6 +6,12 @@
 
 #include "led.h"
 
+void led_heartbeat(uint8_t pin, uint32_t now_ms, bool active)
+{
+  uint32_t half_period_ms = active ? 100u : 500u;
+  gpio_put(pin, (now_ms / half_period_ms) & 1u);
+}
+
 void led_init(uint8_t *led_pins, uint8_t length)
 {
   for (int i = 0; i < length; ++i)

@@ -19,7 +19,7 @@ Names and IDs below match the firmware catalogs (`$MODELS`, `$CTRLS`, `$TRAJS`).
 
 ### Models
 
-- **0 — Off:** Disables model simulation.
+- **0 — Off (default):** Disables model simulation.
 - **1 — Mass-Spring-Damper:** A mass connected to a spring and damper, driven by a force. Used for position tracking and parameter identification.
 - **2 — Pendulum-Cart:** A cart carrying a freely rotating pendulum, driven by a horizontal force. Used for cart tracking or pendulum swing-up and balancing.
 - **3 — Double-Pendulum:** Two coupled pendulum links with two torque inputs. Used for joint-angle tracking.
@@ -29,21 +29,23 @@ Names and IDs below match the firmware catalogs (`$MODELS`, `$CTRLS`, `$TRAJS`).
 
 ### Controllers
 
+- **0 — Off (default):** Disables controller updates and sets all PWM outputs to neutral (50% duty).
+
 For unicycle controllers, **Kin** selects the kinematic model and outputs velocities; **Dyn** selects the dynamic model and outputs wheel torques.
 
-- **0 — PID:** Tracks the mass-spring-damper position using proportional, integral and derivative feedback, with saturation and anti-windup.
-- **1 — IO-Decoupling-3R:** Uses model-based input/output decoupling to track a Cartesian end-effector path with the 3R arm.
-- **2/3 — Static-Lin-Unicycle-Kin/Dyn:** Tracks a guidance point offset from the robot's axle using static feedback linearization.
-- **4/5 — Dynamic-Lin-Unicycle-Kin/Dyn:** Tracks a guidance point on the axle using feedback linearization with an additional controller state. Requires a nonzero extended velocity.
-- **6/7 — Samson-Unicycle-Kin/Dyn:** Tracks a moving reference pose using position and heading errors expressed in the robot frame.
-- **8 — FF-Double-Pendulum:** Combines inverse dynamics with feedback to track both pendulum angles.
-- **9 — FF-Pendulum-Cart:** Uses partial feedback linearization to track cart position; it does not balance the pendulum upright.
-- **10 — FF-MDS:** Tracks mass-spring-damper position using computed force with known mass, damping and stiffness.
-- **11–13 — MDS-Adaptive-Mass/Damping/Stiffness:** Tracks position while estimating one unknown plant parameter online. The estimate need not converge to its true value.
-- **14–16 — MDS-Robust-Mass/Damping/Stiffness:** Tracks position while compensating for bounded uncertainty in one plant parameter.
-- **17–19 — MDS-Estimator-Mass/Damping/Stiffness:** Applies an internal excitation force to identify one plant parameter. These slots ignore the tracking setpoint.
-- **20 — Upright-Pendulum-Cart:** Swings the pendulum up from hanging, then balances it upright while regulating cart position.
-- **21 — Custom:** A template for your own controller; it outputs zero until implemented.
+- **1 — PID:** Tracks the mass-spring-damper position using proportional, integral and derivative feedback, with saturation and anti-windup.
+- **2 — IO-Decoupling-3R:** Uses model-based input/output decoupling to track a Cartesian end-effector path with the 3R arm.
+- **3/4 — Static-Lin-Unicycle-Kin/Dyn:** Tracks a guidance point offset from the robot's axle using static feedback linearization.
+- **5/6 — Dynamic-Lin-Unicycle-Kin/Dyn:** Tracks a guidance point on the axle using feedback linearization with an additional controller state. Requires a nonzero extended velocity.
+- **7/8 — Samson-Unicycle-Kin/Dyn:** Tracks a moving reference pose using position and heading errors expressed in the robot frame.
+- **9 — FF-Double-Pendulum:** Combines inverse dynamics with feedback to track both pendulum angles.
+- **10 — FF-Pendulum-Cart:** Uses partial feedback linearization to track cart position; it does not balance the pendulum upright.
+- **11 — FF-MDS:** Tracks mass-spring-damper position using computed force with known mass, damping and stiffness.
+- **12–14 — MDS-Adaptive-Mass/Damping/Stiffness:** Tracks position while estimating one unknown plant parameter online. The estimate need not converge to its true value.
+- **15–17 — MDS-Robust-Mass/Damping/Stiffness:** Tracks position while compensating for bounded uncertainty in one plant parameter.
+- **18–20 — MDS-Estimator-Mass/Damping/Stiffness:** Applies an internal excitation force to identify one plant parameter. These slots ignore the tracking setpoint.
+- **21 — Upright-Pendulum-Cart:** Swings the pendulum up from hanging, then balances it upright while regulating cart position.
+- **22 — Custom:** A template for your own controller; it outputs zero until implemented.
 
 ### Trajectories
 
@@ -58,6 +60,17 @@ Each trajectory supplies one setpoint channel; a constant setpoint can also be s
 - **6 — Circle-Z:** A scaled cosine-based z coordinate; combine all three coordinates for the 3R spatial path.
 
 ## Your Task
+
+To tune parameters without recompiling, open `scripts/hil_ui.py`, select your
+model/controller/trajectories, stop any run, and open the **Parameters** tab.
+Click **Read parameters**, double-click a value (PID shows **P**, **I**, **D**),
+then click **Apply**. Only fields for your selections are shown. Repeated
+trajectory types share one parameter set. Changes survive resets but not a
+board reboot. Start a new run to reset the pair with the new settings.
+
+The common UART commands are `$PGET,<kind>,<id>*<XOR>\r\n` and
+`$PSET,<kind>,<id>,<values...>*<XOR>\r\n`, where kind is M/C/T. Reads return
+`OK,PGET,<kind>,<id>,1,<values...>`; writes use the same complete ordered list.
 
 Implement `update()` in the assigned `controllers/*_empty.c` file; `init()` and `reset()` are already provided. For trajectory tasks, fill in `src/trajectory_empty.c`. Rebuild with `HIL_REAL_CONTROLLERS=OFF` and the corresponding external-library option `OFF` to use your code.
 
@@ -80,6 +93,15 @@ UART0 is used for communication and telemetry via PC. It is connected to a Raspb
 UART1 is used for communication with the model board.
 
 ## Board Schematics
+
+GPIO 22 LED: 1000 ms blink period when idle, 200 ms while a model/controller
+is selected; both 50% duty. Both boards start in Off (index 0).
+Use `$MODEL,0` on the model board and `$CTRL,0` on the controller board to
+return to idle. Selecting any non-Off slot, including a student stub, switches
+that board to 200 ms. Controller Off clears all PWM outputs to neutral (50% duty).
+The controller sends no model selection at boot.
+Controller IDs have shifted by one (PID is now 1, Custom is 22); reflash both
+boards and update any manual numeric controller commands.
 
 The schematic for the board can be found in [schematics](HIL_Testing_Platform_RP2350.pdf). The board has 8 PWM inputs and 8 PWM outputs, which are used to read the model outputs and drive the model inputs. The board also has two UARTs. Both are configured as 115200 baud 8N1.
 
@@ -191,7 +213,11 @@ python -m pip install -r requirements.txt
 python scripts/hil_ui.py
 ```
 
-Select the two console ports (or use **Autodetect ports**), choose the model/controller pair, and click **Run**. Use **Stop** to end capture.
+The UI starts with **Off** for both model and controller. Select the two console
+ports (or use **Autodetect ports**), choose the model/controller pair, and click
+**Run** to apply the selection and capture telemetry. Either board can remain
+**Off** independently. Choose **Off** and click **Run** to return a board to idle.
+Use **Stop** to end capture; it leaves the selected model/controller running.
 
 The GUI supports:
 

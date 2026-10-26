@@ -5,7 +5,7 @@
 #   1. HIL_MODELS / HIL_CONTROLLERS slot lists (order = runtime slot ids):
 #        "<SLOT_SYMBOL>|<Display Name>"
 #      SLOT_SYMBOL becomes a C enum constant, Display Name is reported by the
-#      "$MODELS" / "$CTRLS" replies (src/comm.c). MODEL_OFF stays first,
+#      "$MODELS" / "$CTRLS" replies (src/comm.c). MODEL_OFF / CTRL_OFF stay first,
 #      Custom stays LAST.
 #   2. Explicit per-variant source lists (NO discovery, NO suffix construction):
 #        HIL_MODEL_SRC   -- model sources (models have no stubs)
@@ -30,6 +30,7 @@ set(HIL_MODELS
 )
 
 set(HIL_CONTROLLERS
+    "CTRL_OFF|Off"
     "CTRL_PID|PID"
     "CTRL_IO3R|IO-Decoupling-3R"
     "CTRL_SL_UNI_KIN|Static-Lin-Unicycle-Kin"

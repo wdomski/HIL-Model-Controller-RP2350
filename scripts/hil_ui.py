@@ -21,6 +21,8 @@ from mpl_toolkits.mplot3d import Axes3D
 from serial.tools import list_ports
 
 if __package__:
+    from .utils.parameters import configuration_parameters, parameter_names
+    from .utils.pairs import TRAJECTORIES
     from .utils.protocol import detect_board
     from .hil_runner import (
         SUPPORTED_PAIRS,
@@ -35,6 +37,8 @@ if __package__:
         write_csv,
     )
 else:
+    from utils.parameters import configuration_parameters, parameter_names
+    from utils.pairs import TRAJECTORIES
     from utils.protocol import detect_board
     from hil_runner import (
         SUPPORTED_PAIRS,
@@ -107,8 +111,15 @@ class HilApp:
         self._latest_time = 0.0
         self._detached = False
         self._closing = False
+        self._parameter_values: dict[tuple[str, int], tuple[float, ...]] = {}
+        self._parameter_rows: dict[tuple[str, int], list[str]] = {}
+        self._parameter_snapshot: tuple[str, ...] | None = None
+        self._parameter_edit: ttk.Entry | None = None
 
         self._build()
+        for variable in (self.model, self.controller, self.trajectory,
+                         self.model_port, self.controller_port):
+            variable.trace_add("write", lambda *_: self._clear_parameters())
         self._refresh_ports()
         self.root.after(100, self._poll_messages)
 
@@ -222,9 +233,12 @@ class HilApp:
         )
 
         row += 1
-        readings = ttk.LabelFrame(content, text="Instantaneous values", padding=4)
-        readings.grid(row=row, column=0, columnspan=3, sticky="nsew", pady=(12, 0))
+        panels = ttk.Notebook(content)
+        panels.grid(row=row, column=0, columnspan=3, sticky="nsew", pady=(12, 0))
         content.rowconfigure(row, weight=1)
+        readings = ttk.Frame(panels, padding=4)
+        panels.add(readings, text="Instantaneous values")
+        self._build_parameters_panel(panels)
         readings.columnconfigure(0, weight=1)
         readings.rowconfigure(0, weight=1)
         self._readings = ttk.Treeview(
@@ -370,6 +384,152 @@ class HilApp:
         self._time_scroll.grid(row=2, column=0, sticky="ew", pady=(6, 0))
         self._notebook.bind("<<NotebookTabChanged>>", lambda _event: self._redraw())
         self._reset_plots()
+
+    def _build_parameters_panel(self, panels: ttk.Notebook) -> None:
+        panel = ttk.Frame(panels, padding=4)
+        panels.add(panel, text="Parameters")
+        panel.columnconfigure(0, weight=1)
+        panel.rowconfigure(2, weight=1)
+        actions = ttk.Frame(panel)
+        actions.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self.read_parameters_button = ttk.Button(
+            actions, text="Read parameters", command=self._read_parameters
+        )
+        self.read_parameters_button.pack(side="left")
+        self.apply_parameters_button = ttk.Button(
+            actions, text="Apply", command=self._apply_parameters, state="disabled"
+        )
+        self.apply_parameters_button.pack(side="left", padx=6)
+        ttk.Label(panel, text="Double-click a value to edit. Apply between runs.").grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=5
+        )
+        self._parameters = ttk.Treeview(panel, columns=("value",), height=8)
+        self._parameters.heading("#0", text="Parameter")
+        self._parameters.heading("value", text="Value")
+        self._parameters.column("#0", width=270, minwidth=170)
+        self._parameters.column("value", width=110, minwidth=70)
+        self._parameters.grid(row=2, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(panel, command=self._parameters.yview)
+        scroll.grid(row=2, column=1, sticky="ns")
+        self._parameters.configure(yscrollcommand=scroll.set)
+        self._parameters.bind("<Double-1>", self._edit_parameter)
+
+    def _parameter_context(self) -> tuple[str, ...]:
+        return tuple(v.get() for v in (self.model_port, self.controller_port,
+                                      self.model, self.controller, self.trajectory))
+
+    def _parameter_buttons(self) -> None:
+        idle = self._worker is None
+        self.read_parameters_button.configure(state="normal" if idle else "disabled")
+        self.apply_parameters_button.configure(
+            state="normal" if idle and self._parameter_snapshot is not None else "disabled"
+        )
+
+    def _clear_parameters(self) -> None:
+        self._finish_parameter_edit()
+        self._parameter_values.clear()
+        self._parameter_rows.clear()
+        self._parameter_snapshot = None
+        if hasattr(self, "_parameters"):
+            self._parameters.delete(*self._parameters.get_children())
+            self._parameter_buttons()
+
+    def _show_parameters(self, values: dict[tuple[str, int], tuple[float, ...]]) -> None:
+        self._clear_parameters()
+        self._parameter_values = values
+        self._parameter_snapshot = self._parameter_context()
+        trajectories = {id: name for name, id in TRAJECTORIES.items()}
+        for key, block in values.items():
+            kind, id = key
+            label = {"M": f"Model: {self.model.get()}",
+                     "C": f"Controller: {self.controller.get()}",
+                     "T": f"Trajectory: {trajectories.get(id, id)}"}[kind]
+            parent = self._parameters.insert("", "end", text=label, open=True)
+            self._parameter_rows[key] = [
+                self._parameters.insert(parent, "end", text=name, values=(f"{v:.9g}",))
+                for name, v in zip(parameter_names(kind, id), block)
+            ]
+            if not block:
+                self._parameters.insert(parent, "end", text="No editable parameters")
+        self._parameter_buttons()
+
+    def _finish_parameter_edit(self, _event: object | None = None) -> None:
+        entry = self._parameter_edit
+        if entry is not None:
+            self._parameter_edit = None
+            self._parameters.set(self._parameter_edit_row, "value", entry.get())
+            entry.destroy()
+
+    def _edit_parameter(self, event: tk.Event) -> None:
+        self._finish_parameter_edit()
+        if self._worker is not None:
+            return
+        row = self._parameters.identify_row(event.y)
+        if self._parameters.identify_column(event.x) != "#1" or not any(
+            row in rows for rows in self._parameter_rows.values()
+        ):
+            return
+        bounds = self._parameters.bbox(row, "value")
+        if not bounds:
+            return
+        entry = self._parameter_edit = ttk.Entry(self._parameters)
+        self._parameter_edit_row = row
+        entry.insert(0, self._parameters.set(row, "value"))
+        entry.place(x=bounds[0], y=bounds[1], width=bounds[2], height=bounds[3])
+        entry.select_range(0, "end")
+        entry.focus_set()
+        entry.bind("<Return>", self._finish_parameter_edit)
+        entry.bind("<FocusOut>", self._finish_parameter_edit)
+
+    def _read_parameters(self) -> None:
+        self._parameter_operation(False)
+
+    def _apply_parameters(self) -> None:
+        self._parameter_operation(True)
+
+    def _parameter_operation(self, write: bool) -> None:
+        if self._worker is not None:
+            return
+        self._finish_parameter_edit()
+        context = self._parameter_context()
+        try:
+            pair = SUPPORTED_PAIRS[(self.model.get(), self.controller.get())]
+            ids = tuple(dict.fromkeys(TRAJECTORIES[name.strip().lower()]
+                        for name in self.trajectory.get().split(",") if name.strip()))
+            if ids and len([name for name in self.trajectory.get().split(",") if name.strip()]) != len(pair.setpoint_channels):
+                raise HilError("Provide one trajectory per setpoint channel")
+            keys = (("M", pair.model_id), ("C", pair.controller_id)) + tuple(("T", id) for id in ids)
+            changes = None
+            if write:
+                if context != self._parameter_snapshot:
+                    raise HilError("Read parameters for this selection first")
+                changes = {key: tuple(float(self._parameters.set(row, "value")) for row in rows)
+                           for key, rows in self._parameter_rows.items()}
+                if not all(math.isfinite(v) for block in changes.values() for v in block):
+                    raise ValueError("Parameters must be finite numbers")
+        except (KeyError, ValueError, HilError) as exc:
+            messagebox.showerror("Parameters", f"Invalid parameter settings: {exc}")
+            return
+        model_port = self._port_devices.get(self.model_port.get(), self.model_port.get()).strip()
+        controller_port = self._port_devices.get(self.controller_port.get(), self.controller_port.get()).strip()
+        self._stop_event.clear()
+        self.run_button.configure(state="disabled")
+        self.detect_button.configure(state="disabled")
+        self.status.set("Applying parameters..." if write else "Reading parameters...")
+        self._worker = threading.Thread(
+            target=self._parameter_worker,
+            args=(context, model_port, controller_port, keys, changes), daemon=True,
+        )
+        self._parameter_buttons()
+        self._worker.start()
+
+    def _parameter_worker(self, context, model_port, controller_port, keys, changes) -> None:
+        try:
+            values = configuration_parameters(model_port, controller_port, keys, changes)
+            self._messages.put(("parameters", (context, values, changes is not None)))
+        except Exception as exc:
+            prefix = "Apply incomplete; read parameters again. Some blocks may already be applied. " if changes is not None else ""
+            self._messages.put(("parameter_error", prefix + str(exc)))
 
     def _apply_window(self) -> None:
         try:
@@ -578,12 +738,15 @@ class HilApp:
             box.set(labels.get(device, device))
 
     def _autodetect(self) -> None:
+        if self._worker is not None:
+            return
         self._stop_event.clear()
         self.run_button.configure(state="disabled")
         self.detect_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.status.set("Scanning serial ports...")
         self._worker = threading.Thread(target=self._detect_worker, daemon=True)
+        self._parameter_buttons()
         self._worker.start()
 
     def _detect_worker(self) -> None:
@@ -740,6 +903,9 @@ class HilApp:
             self.status.set(f"Exported plot to {selected}")
 
     def _start(self) -> None:
+        if self._worker is not None:
+            return
+        self._finish_parameter_edit()
         try:
             config = ExperimentConfig(
                 model_port=self._port_devices.get(
@@ -778,6 +944,7 @@ class HilApp:
         self._worker = threading.Thread(
             target=self._run_worker, args=(config, output, self.export_csv.get()), daemon=True
         )
+        self._parameter_buttons()
         self._worker.start()
 
     def _run_worker(
@@ -814,6 +981,20 @@ class HilApp:
                 kind, payload = self._messages.get_nowait()
                 if kind == "status":
                     self.status.set(str(payload))
+                elif kind == "parameters":
+                    context, values, applied = payload
+                    self._set_idle()
+                    if context == self._parameter_context():
+                        self._show_parameters(values)
+                        self.status.set("Parameters applied and read back" if applied else "Parameters read from boards")
+                    else:
+                        self._clear_parameters()
+                        self.status.set("Selection changed; read parameters again")
+                elif kind == "parameter_error":
+                    self._set_idle()
+                    self._clear_parameters()
+                    self.status.set(str(payload))
+                    messagebox.showerror("Parameters", str(payload))
                 elif kind == "ports":
                     if not isinstance(payload, tuple) or len(payload) != 2:
                         raise HilError("Invalid port scan result")
@@ -887,6 +1068,7 @@ class HilApp:
         self.detect_button.configure(state="normal")
         self.stop_button.configure(state="disabled")
         self._worker = None
+        self._parameter_buttons()
 
 
 def main() -> None:

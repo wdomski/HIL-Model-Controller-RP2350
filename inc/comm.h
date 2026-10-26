@@ -16,6 +16,8 @@ typedef struct {
     int (*controller_select)(int id);
     void (*reset)(void);
     void (*reset_remote)(void);
+    /* Return the ordered value count, or -1. Writes must be all-or-nothing. */
+    int (*parameters)(char kind, int id, float *values, size_t count, int write);
 } comm_config_t;
 
 int comm_init(const comm_config_t *config);
